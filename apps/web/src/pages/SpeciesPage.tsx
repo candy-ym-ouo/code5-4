@@ -37,7 +37,7 @@ export function SpeciesPage() {
         <div>
           <p className="dossier-description">{detail.data.species.description}</p>
           <dl className="dossier-facts">
-            <div><dt>保护状态</dt><dd>{detail.data.species.protected ? '禁止破坏性采集' : '常规观察对象'}</dd></div>
+            <div><dt>保护状态</dt><dd>{detail.data.species.protectionTierLabel ?? (detail.data.species.protected ? '禁止破坏性采集' : '常规观察对象')}</dd></div>
             <div><dt>适宜温度</dt><dd>{detail.data.species.preferred.temperatureC}°C</dd></div>
             <div><dt>适宜湿度</dt><dd>{detail.data.species.preferred.humidity}%</dd></div>
             <div><dt>推荐采集</dt><dd>{detail.data.species.sampleProtocol.join('、')}</dd></div>

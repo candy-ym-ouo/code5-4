@@ -119,6 +119,25 @@ CREATE TABLE IF NOT EXISTS samples (
 CREATE INDEX IF NOT EXISTS idx_samples_save_season
   ON samples(save_id, year, season, species_id, method);
 
+-- 季配额账本：每个“存档/年/季/物种/方法”一行，钉住该季配额总量。
+-- 实际已用量始终以 samples 表计数为准；账本只在首次需要该季配额时写入。
+-- 行的写入是原子闸门：仅当 COUNT(samples) < quota_granted 时插入成功。
+CREATE TABLE IF NOT EXISTS sample_quota_ledger (
+  save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+  year INTEGER NOT NULL,
+  season TEXT NOT NULL,
+  species_id TEXT NOT NULL,
+  method TEXT NOT NULL,
+  quota_granted INTEGER NOT NULL,
+  factors_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (save_id, year, season, species_id, method)
+);
+
+CREATE INDEX IF NOT EXISTS idx_quota_ledger_season
+  ON sample_quota_ledger(save_id, year, season);
+
 CREATE TABLE IF NOT EXISTS season_summaries (
   id TEXT PRIMARY KEY,
   save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,

@@ -199,6 +199,7 @@ export const SPECIES: SpeciesDefinition[] = [
     lifeForm: '乔木',
     description: '溪谷中的落叶针叶乔木，禁止破坏性采样。',
     protected: true,
+    protectionTier: 'class_i',
     zones: {
       stream_valley: { initialPopulation: 78, carryingCapacity: 145 },
       mixed_forest: { initialPopulation: 20, carryingCapacity: 80 }

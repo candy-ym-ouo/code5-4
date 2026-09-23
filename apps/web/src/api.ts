@@ -82,6 +82,8 @@ export const api = {
         lifeForm: string;
         description: string;
         protected: boolean;
+        protectionTier: 'unprotected' | 'local' | 'class_ii' | 'class_i';
+        protectionTierLabel?: string;
         preferred: Record<string, number>;
         sampleProtocol: string[];
         colors: Record<string, string>;

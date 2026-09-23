@@ -1,5 +1,6 @@
 import type { SampleMethod, Season, SiteId } from '@shanhai/contracts';
 import { SPECIES_BY_ID, SITES_BY_ID } from './catalog.ts';
+import { computeSampleQuota } from './quota.ts';
 import { createRng } from './rng.ts';
 import type {
   PlantPresentation,
@@ -371,6 +372,11 @@ export function getStatus(population: number, carryingCapacity: number, health: 
   return 'stable';
 }
 
+export interface PinnedQuota {
+  limit: number;
+  factors?: import('@shanhai/contracts').QuotaFactors;
+}
+
 export function evaluateSample(
   definition: SpeciesDefinition,
   state: SpeciesState,
@@ -378,45 +384,45 @@ export function evaluateSample(
   season: Season,
   day: number,
   method: SampleMethod,
-  used: number
+  used: number,
+  pinned?: PinnedQuota
 ): SampleDecision {
-  const limits: Record<SampleMethod, number> = {
-    photo: 99,
-    rubbing: 3,
-    litter: 3,
-    cutting: 1
-  };
   const emptyEffects = { health: 0, populationDelta: 0, seedBankDelta: 0 };
-
-  if (used >= limits[method]) {
-    return {
-      allowed: false,
-      reason: `${SAMPLE_LABELS[method]} 已达到本季安全上限`,
-      protocolMatch: false,
-      effects: emptyEffects,
-      messages: []
-    };
-  }
+  const quota = computeSampleQuota({
+    method,
+    definition,
+    state,
+    site,
+    season,
+    day,
+    used,
+    pinnedLimit: pinned?.limit,
+    pinnedFactors: pinned?.factors
+  });
+  const deny = (reason: string): SampleDecision => ({
+    allowed: false,
+    reason,
+    protocolMatch: false,
+    effects: emptyEffects,
+    messages: [],
+    quota
+  });
 
   const profile = definition.zones[site.siteId];
   if (!profile) {
-    return {
-      allowed: false,
-      reason: '目标不在当前区域',
-      protocolMatch: false,
-      effects: emptyEffects,
-      messages: []
-    };
+    return deny('目标不在当前区域');
+  }
+
+  if (used >= quota.limit) {
+    return deny(
+      quota.limit <= 0
+        ? `${SAMPLE_LABELS[method]} 在当前物候与保护级别下本季配额为 0`
+        : `${SAMPLE_LABELS[method]} 已达到本季动态安全配额（${used}/${quota.limit}）`
+    );
   }
 
   if (method === 'cutting' && (state.health < 65 || state.population < profile.carryingCapacity * 0.6)) {
-    return {
-      allowed: false,
-      reason: '目标健康度或种群数量低于安全采集阈值',
-      protocolMatch: false,
-      effects: emptyEffects,
-      messages: []
-    };
+    return deny('目标健康度或种群数量低于安全采集阈值');
   }
 
   const presentation = getPlantPresentation(definition, state, season, day);
@@ -441,23 +447,11 @@ export function evaluateSample(
   }
 
   if (method === 'cutting' && definition.protected) {
-    return {
-      allowed: false,
-      reason: '保护物种禁止剪取',
-      protocolMatch: false,
-      effects: emptyEffects,
-      messages: []
-    };
+    return deny('保护物种禁止剪取');
   }
 
   if (definition.protected && method !== 'photo' && !protocolMatch) {
-    return {
-      allowed: false,
-      reason: '保护物种只允许符合当前物候的非破坏性记录',
-      protocolMatch: false,
-      effects: emptyEffects,
-      messages: []
-    };
+    return deny('保护物种只允许符合当前物候的非破坏性记录');
   }
 
   const effects = { ...emptyEffects };
@@ -493,20 +487,15 @@ export function evaluateSample(
 
   const destructive = method !== 'photo' && (effects.health < 0 || effects.populationDelta < 0 || effects.seedBankDelta < 0);
   if (destructive && (state.health < 40 || state.population < profile.carryingCapacity * 0.35)) {
-    return {
-      allowed: false,
-      reason: '目标健康度或种群数量已低于破坏性采集安全线',
-      protocolMatch,
-      effects: emptyEffects,
-      messages: []
-    };
+    return deny('目标健康度或种群数量已低于破坏性采集安全线');
   }
 
   return {
     allowed: true,
     protocolMatch,
     effects,
-    messages
+    messages,
+    quota
   };
 }
 

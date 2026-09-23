@@ -1,4 +1,14 @@
-import type { LeafTexture, PhenologyStage, SampleMethod, Season, SiteId } from '@shanhai/contracts';
+import type {
+  LeafTexture,
+  PhenologyStage,
+  ProtectionTier,
+  QuotaFactors,
+  SampleMethod,
+  Season,
+  SiteId
+} from '@shanhai/contracts';
+
+export type { QuotaFactors };
 
 export interface SiteDefinition {
   id: SiteId;
@@ -25,6 +35,8 @@ export interface SpeciesDefinition {
   lifeForm: string;
   description: string;
   protected: boolean;
+  /** 法定/设定保护级别；缺省按 protected 字段推断。 */
+  protectionTier?: ProtectionTier;
   zones: Partial<Record<SiteId, ZoneProfile>>;
   preferred: {
     temperatureC: number;
@@ -90,6 +102,17 @@ export interface PlantPresentation {
   leafTexture: LeafTexture;
 }
 
+export interface SampleQuota {
+  method: SampleMethod;
+  /** 本季剩余判断所依据的总量上限（动态计算或账本钉住）。 */
+  limit: number;
+  /** 已使用次数。 */
+  used: number;
+  factors: QuotaFactors;
+  /** 上限是否已被本季配额账本钉住（钉住后不再随状态浮动）。 */
+  pinned: boolean;
+}
+
 export interface SampleDecision {
   allowed: boolean;
   reason?: string;
@@ -100,6 +123,7 @@ export interface SampleDecision {
     seedBankDelta: number;
   };
   messages: string[];
+  quota: SampleQuota;
 }
 
 export interface SeasonEvolutionResult {

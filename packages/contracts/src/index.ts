@@ -25,6 +25,16 @@ export type PhenologyStage = (typeof PHENOLOGY_STAGES)[number];
 export const LEAF_TEXTURES = ['smooth', 'leathery', 'rough', 'pubescent', 'waxy', 'needle', 'compound'] as const;
 export type LeafTexture = (typeof LEAF_TEXTURES)[number];
 
+export const PROTECTION_TIERS = ['unprotected', 'local', 'class_ii', 'class_i'] as const;
+export type ProtectionTier = (typeof PROTECTION_TIERS)[number];
+
+export const PROTECTION_TIER_LABELS: Record<ProtectionTier, string> = {
+  unprotected: '常规物种',
+  local: '地方重点保护',
+  class_ii: '国家二级保护',
+  class_i: '国家一级保护'
+};
+
 export const SAMPLE_METHODS = ['photo', 'rubbing', 'litter', 'cutting'] as const;
 export type SampleMethod = (typeof SAMPLE_METHODS)[number];
 
@@ -91,7 +101,8 @@ export const PublicSpeciesSchema = z.object({
   latinName: z.string(),
   lifeForm: z.string(),
   description: z.string(),
-  protected: z.boolean()
+  protected: z.boolean(),
+  protectionTier: z.enum(PROTECTION_TIERS)
 });
 
 export interface CatalogMeta {
@@ -120,12 +131,30 @@ export interface SiteSnapshot {
   species: SpeciesSnapshot[];
 }
 
+export interface QuotaFactors {
+  base: number;
+  phenology: number;
+  protection: number;
+  occupancy: number;
+  disturbance: number;
+}
+
+export interface SampleLimitView {
+  used: number;
+  limit: number;
+  allowed: boolean;
+  reason?: string;
+  factors: QuotaFactors;
+  pinned: boolean;
+}
+
 export interface SpeciesSnapshot {
   id: string;
   name: string;
   latinName: string;
   lifeForm: string;
   protected: boolean;
+  protectionTier: ProtectionTier;
   population: number;
   carryingCapacity: number;
   health: number;
@@ -141,7 +170,7 @@ export interface SpeciesSnapshot {
     bloomPeakDay: number;
     bloomEndDay: number;
   };
-  sampleLimits: Record<SampleMethod, { used: number; limit: number; allowed: boolean; reason?: string }>;
+  sampleLimits: Record<SampleMethod, SampleLimitView>;
   unlocked: boolean;
 }
 

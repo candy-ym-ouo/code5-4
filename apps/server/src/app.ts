@@ -99,7 +99,8 @@ export function createApp(options: CreateAppOptions = {}) {
         latinName: species.latinName,
         lifeForm: species.lifeForm,
         description: species.description,
-        protected: species.protected
+        protected: species.protected,
+        protectionTier: species.protectionTier ?? (species.protected ? 'class_i' : 'unprotected')
       }))
     });
   });

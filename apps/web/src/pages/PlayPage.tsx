@@ -4,6 +4,7 @@ import {
   SEASON_LABELS,
   SLOT_LABELS,
   type GameCommand,
+  type QuotaFactors,
   type SampleMethod,
   type SpeciesSnapshot
 } from '@shanhai/contracts';
@@ -193,22 +194,32 @@ export function PlayPage() {
                     <h2>采集方式</h2>
                   </div>
                 </div>
-                <p className="helper-text">绿色表示安全且当前可用。错误协议仍可能执行，但会真实影响生态。</p>
+                <p className="helper-text">
+                  绿色表示安全且当前可用。配额随物候期、保护级别与区域承载力逐季变动；错误协议仍可能执行，但会真实影响生态。
+                </p>
                 <div className="sample-grid">
                   {(Object.keys(SAMPLE_LABELS) as SampleMethod[]).map((method) => {
                     const limit = selectedSpecies?.sampleLimits[method];
+                    const exhausted = limit ? limit.used >= limit.limit : false;
                     return (
                       <button
                         key={method}
                         type="button"
-                        className="sample-button"
+                        className={`sample-button${exhausted ? ' sample-exhausted' : ''}`}
                         disabled={pending || !selectedSpecies || !limit?.allowed}
                         onClick={() => {
                           if (selectedSpecies) void run({ type: 'TAKE_SAMPLE', speciesId: selectedSpecies.id, method });
                         }}
+                        title={limit ? quotaTitle(limit.factors) : undefined}
                       >
                         <strong>{SAMPLE_LABELS[method]}</strong>
-                        <span>{limit ? `${limit.used}/${limit.limit}` : '不可用'}</span>
+                        <span>
+                          {limit ? `${limit.used}/${limit.limit}` : '不可用'}
+                          {limit?.pinned ? ' · 本季锁定' : ''}
+                        </span>
+                        {limit && !limit.pinned && limit.limit > 0 && (
+                          <small className="quota-hint">动态配额</small>
+                        )}
                         {limit?.reason && <small>{limit.reason}</small>}
                       </button>
                     );
@@ -308,4 +319,8 @@ function weatherSymbol(weather: string): string {
 
 function weatherLabel(weather: string): string {
   return ({ sunny: '晴', cloudy: '多云', overcast: '阴', light_rain: '小雨', heavy_rain: '大雨', fog: '雾', snow: '雪' } as Record<string, string>)[weather] ?? weather;
+}
+
+function quotaTitle(factors: QuotaFactors): string {
+  return `基础 ${factors.base} × 物候 ${factors.phenology} × 保护 ${factors.protection} × 承载力 ${factors.occupancy} × 干扰 ${factors.disturbance}`;
 }

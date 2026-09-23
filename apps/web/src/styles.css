@@ -269,6 +269,9 @@ input[type="color"] { width: 46px; min-height: 38px; padding: .15rem; }
 .sample-button:not(:disabled):hover { border-color: var(--moss); background: var(--season-soft); }
 .sample-button span { float: right; color: var(--muted); font-size: .7rem; }
 .sample-button small { display: block; margin-top: .3rem; color: var(--red); }
+.sample-button .quota-hint { color: var(--moss); font-size: .66rem; letter-spacing: .08em; }
+.sample-button.sample-exhausted { border-style: dashed; opacity: .62; }
+.sample-button.sample-exhausted span { color: var(--red); }
 .environment-form { display: grid; gap: .7rem; }
 .environment-form .four-columns { grid-template-columns: 1fr 1fr; }
 .restoration-card { display: grid; grid-template-columns: 1fr minmax(220px, .7fr) auto; gap: 1rem; align-items: end; padding: 1.25rem; border-color: rgba(73, 119, 85, .35); background: linear-gradient(135deg, #dbe8d3, #f2f1e5); }

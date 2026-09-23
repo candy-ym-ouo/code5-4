@@ -12,11 +12,12 @@ import type {
   SpeciesSnapshot,
   WorldSnapshot
 } from '@shanhai/contracts';
-import { SEASON_LABELS } from '@shanhai/contracts';
+import { PROTECTION_TIER_LABELS, SAMPLE_METHODS, SEASON_LABELS } from '@shanhai/contracts';
 import {
   applyOverwinter,
   applySampleEffects,
   CATALOG_VERSION,
+  computeSampleQuota,
   createSpeciesState,
   disperseSpecies,
   evaluateSample,
@@ -24,6 +25,7 @@ import {
   generateSiteState,
   getPhenologyWindow,
   getPlantPresentation,
+  getProtectionTier,
   getStatus,
   getSuitability,
   nextSeason,
@@ -31,6 +33,7 @@ import {
   SPECIES_BY_ID,
   SITES,
   SITES_BY_ID,
+  type QuotaFactors,
   type SiteState,
   type SpeciesState
 } from '@shanhai/game-core';
@@ -109,19 +112,24 @@ interface SessionRecord {
   token_hash: string;
 }
 
-const SAMPLE_LIMITS: Record<SampleMethod, number> = {
-  photo: 99,
-  rubbing: 3,
-  litter: 3,
-  cutting: 1
-};
-
 const SAMPLE_LABELS: Record<SampleMethod, string> = {
   photo: '拍照',
   rubbing: '拓印',
   litter: '落叶采集',
   cutting: '标准剪取'
 };
+
+const PHOTO_METHOD: SampleMethod = 'photo';
+
+interface LedgerRow {
+  save_id: string;
+  year: number;
+  season: Season;
+  species_id: string;
+  method: SampleMethod;
+  quota_granted: number;
+  factors_json: string;
+}
 
 const RESTORATION_LABELS: Record<string, string> = {
   reduce_disturbance: '降低区域干扰',
@@ -304,12 +312,19 @@ export class GameService {
         lifeForm: definition.lifeForm,
         description: definition.description,
         protected: definition.protected,
+        protectionTier: getProtectionTier(definition),
+        protectionTierLabel: PROTECTION_TIER_LABELS[getProtectionTier(definition)],
         preferred: definition.preferred,
         sampleProtocol: definition.sampleProtocol,
         colors: definition.colors
       },
       states: states.map((state) => ({
-        ...this.toSpeciesSnapshot(save, state, new Map()),
+        ...this.toSpeciesSnapshot(
+          save,
+          state,
+          this.getSeasonSampleUsage(save.id, save.year, save.season),
+          this.getSeasonQuotaLedger(save.id, save.year, save.season)
+        ),
         siteId: state.siteId,
         siteName: SITES_BY_ID.get(state.siteId)?.name ?? state.siteId
       })),
@@ -372,7 +387,12 @@ export class GameService {
         );
       }
 
+      // 跨季恢复 / 旧档 / 外部导入：以样本事实为准补齐本季配额账本。
+      this.reconcileCurrentSeasonQuota(save);
+
       const outcome = this.applyCommand(save, request.command);
+      // 提交前统一不变量校验：样本与生态影响必须同时成立，否则整笔事务回滚。
+      this.verifyQuotaInvariants(save);
       save.revision += 1;
       this.updateSave(save);
       const sequenceRow = this.store.db
@@ -453,7 +473,10 @@ export class GameService {
         exportRow.save_id
       );
       this.store.db.prepare('DELETE FROM save_exports WHERE save_id = ?').run(exportRow.save_id);
-      return this.getSaveOrThrow(exportRow.save_id, sessionId);
+      const reattached = this.getSaveOrThrow(exportRow.save_id, sessionId);
+      // 跨环境恢复后先对账，保证后续采集看到的配额与历史样本严格一致。
+      this.reconcileCurrentSeasonQuota(reattached);
+      return reattached;
     });
   }
 
@@ -690,9 +713,26 @@ export class GameService {
       throw new AppError('SPECIES_NOT_VISIBLE', '当前区域没有可采集的目标物种', 409);
     }
     const used = this.countSamples(save.id, save.year, save.season, speciesId, method);
-    const decision = evaluateSample(definition, state, site, save.season, save.day, method, used);
+    // 配额账本一旦在本季建立即钉住上限；未建立时按当前生态状态动态计算。
+    const ledger = this.getQuotaLedger(save.id, save.year, save.season, speciesId, method);
+    const decision = evaluateSample(
+      definition,
+      state,
+      site,
+      save.season,
+      save.day,
+      method,
+      used,
+      pinnedQuotaFrom(ledger)
+    );
     if (!decision.allowed) {
       throw new AppError('SAMPLE_LIMIT_REACHED', decision.reason ?? '当前不能执行采集', 409);
+    }
+
+    // 原子闸门：账本插入/升额只在 samples 实际计数仍小于授予配额时成功。
+    // 与外层事务配合，任何并发超额都会让整个命令回滚。
+    if (method !== PHOTO_METHOD) {
+      this.grantQuota(save, speciesId, method, decision.quota.limit, decision.quota.factors, used);
     }
 
     const nextState = applySampleEffects(state, decision, save.current_site_id);
@@ -724,6 +764,7 @@ export class GameService {
         JSON.stringify({ ...decision.effects, messages: decision.messages }),
         new Date().toISOString()
       );
+
     this.consumeAction(save, 1);
     return {
       event: {
@@ -733,6 +774,7 @@ export class GameService {
           ...decision.messages,
           `健康变化 ${formatSigned(decision.effects.health)}`,
           `种群变化 ${formatSigned(decision.effects.populationDelta)}`,
+          `本季配额 ${method === PHOTO_METHOD ? '不限制' : `${used + 1}/${decision.quota.limit}`}`,
           '消耗 1 个行动点'
         ],
         payload: {
@@ -740,7 +782,13 @@ export class GameService {
           speciesId,
           method,
           protocolMatch: decision.protocolMatch,
-          effects: decision.effects
+          effects: decision.effects,
+          quota: {
+            used: used + 1,
+            limit: decision.quota.limit,
+            pinned: decision.quota.pinned,
+            factors: decision.quota.factors
+          }
         }
       },
       evaluation: decision
@@ -1136,6 +1184,7 @@ export class GameService {
     for (const row of sampleCounts) {
       sampleUsage.set(`${row.species_id}:${row.method}`, Number(row.used));
     }
+    const quotaLedger = this.getSeasonQuotaLedger(save.id, save.year, save.season);
     const unlockCounts = this.store.db
       .prepare(
         `SELECT species_id, COUNT(*) AS count
@@ -1150,7 +1199,7 @@ export class GameService {
       const states = (speciesBySite.get(site.id) ?? [])
         .filter((state) => state.population > 1)
         .map((state) => ({
-          ...this.toSpeciesSnapshot(save, state, sampleUsage),
+          ...this.toSpeciesSnapshot(save, state, sampleUsage, quotaLedger),
           unlocked: unlocked.has(state.speciesId)
         }))
         .sort((left, right) => right.population - left.population);
@@ -1213,7 +1262,12 @@ export class GameService {
     };
   }
 
-  private toSpeciesSnapshot(save: SaveRecord, state: SpeciesState, sampleUsage: Map<string, number>): SpeciesSnapshot {
+  private toSpeciesSnapshot(
+    save: SaveRecord,
+    state: SpeciesState,
+    sampleUsage: Map<string, number>,
+    quotaLedger: Map<string, LedgerRow>
+  ): SpeciesSnapshot {
     const definition = SPECIES_BY_ID.get(state.speciesId);
     if (!definition) {
       throw new Error(`Missing species definition ${state.speciesId}`);
@@ -1223,18 +1277,63 @@ export class GameService {
     const effectivePhenology = getPhenologyWindow(definition, state, save.season);
     const site = this.getSiteState(save.id, save.year, state.siteId);
     const sampleLimits = Object.fromEntries(
-      (Object.keys(SAMPLE_LIMITS) as SampleMethod[]).map((method) => {
+      SAMPLE_METHODS.map((method) => {
         const used = sampleUsage.get(`${state.speciesId}:${method}`) ?? 0;
-        const decision = site
-          ? evaluateSample(definition, state, site, save.season, save.day, method, used)
-          : { allowed: false, reason: '当前区域环境数据缺失' };
+        const ledger = quotaLedger.get(ledgerKey(state.speciesId, method));
+        if (!site) {
+          const fallback = computeSampleQuota({
+            method,
+            definition,
+            state,
+            site: {
+              saveId: save.id,
+              year: save.year,
+              siteId: state.siteId,
+              weather: 'unknown',
+              temperatureC: 0,
+              humidity: 0,
+              soilMoisture: 0,
+              lightLux: 0,
+              windSpeed: 0,
+              disturbance: 0
+            },
+            season: save.season,
+            day: save.day,
+            used,
+            pinnedLimit: ledger?.quota_granted,
+            pinnedFactors: parseLedgerFactors(ledger)
+          });
+          return [
+            method,
+            {
+              used,
+              limit: fallback.limit,
+              allowed: false,
+              reason: '当前区域环境数据缺失',
+              factors: fallback.factors,
+              pinned: fallback.pinned
+            }
+          ];
+        }
+        const decision = evaluateSample(
+          definition,
+          state,
+          site,
+          save.season,
+          save.day,
+          method,
+          used,
+          pinnedQuotaFrom(ledger)
+        );
         return [
           method,
           {
             used,
-            limit: SAMPLE_LIMITS[method],
+            limit: decision.quota.limit,
             allowed: decision.allowed,
-            reason: decision.allowed ? undefined : decision.reason ?? '当前不可采集'
+            reason: decision.allowed ? undefined : decision.reason ?? '当前不可采集',
+            factors: decision.quota.factors,
+            pinned: decision.quota.pinned
           }
         ];
       })
@@ -1246,6 +1345,7 @@ export class GameService {
       latinName: definition.latinName,
       lifeForm: definition.lifeForm,
       protected: definition.protected,
+      protectionTier: getProtectionTier(definition),
       population: round(state.population, 1),
       carryingCapacity: profile.carryingCapacity,
       health: round(state.health, 1),
@@ -1473,6 +1573,239 @@ export class GameService {
       ).count
     );
   }
+
+  private getSeasonSampleUsage(saveId: string, year: number, season: Season): Map<string, number> {
+    const rows = this.store.db
+      .prepare(
+        `SELECT species_id, method, COUNT(*) AS used
+         FROM samples WHERE save_id = ? AND year = ? AND season = ?
+         GROUP BY species_id, method`
+      )
+      .all(saveId, year, season) as unknown as Array<{ species_id: string; method: SampleMethod; used: number }>;
+    return new Map(rows.map((row) => [`${row.species_id}:${row.method}`, Number(row.used)]));
+  }
+
+  private getQuotaLedger(
+    saveId: string,
+    year: number,
+    season: Season,
+    speciesId: string,
+    method: SampleMethod
+  ): LedgerRow | null {
+    const row = this.store.db
+      .prepare(
+        `SELECT * FROM sample_quota_ledger
+         WHERE save_id = ? AND year = ? AND season = ? AND species_id = ? AND method = ?`
+      )
+      .get(saveId, year, season, speciesId, method) as unknown as LedgerRow | undefined;
+    return row ?? null;
+  }
+
+  private getSeasonQuotaLedger(saveId: string, year: number, season: Season): Map<string, LedgerRow> {
+    const rows = this.store.db
+      .prepare('SELECT * FROM sample_quota_ledger WHERE save_id = ? AND year = ? AND season = ?')
+      .all(saveId, year, season) as unknown as LedgerRow[];
+    return new Map(rows.map((row) => [ledgerKey(row.species_id, row.method), row]));
+  }
+
+  /**
+   * 原子配额闸门。
+   * - 账本不存在：仅当真实样本计数仍小于本次授予配额时才插入。
+   * - 账本已存在：授予量在季内钉住，计数仍在额度内即放行；
+   *   恢复路径（reconcile）需要提额时只允许上调到不低于历史用量的值。
+   * 条件不满足时抛出配额耗尽错误，由外层事务整体回滚。
+   */
+  private grantQuota(
+    save: SaveRecord,
+    speciesId: string,
+    method: SampleMethod,
+    limit: number,
+    factors: QuotaFactors,
+    used: number
+  ): LedgerRow {
+    const now = new Date().toISOString();
+    const insert = this.store.db
+      .prepare(
+        `INSERT INTO sample_quota_ledger
+           (save_id, year, season, species_id, method, quota_granted, factors_json, created_at, updated_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+         WHERE (
+           SELECT COUNT(*) FROM samples
+           WHERE save_id = ? AND year = ? AND season = ? AND species_id = ? AND method = ?
+         ) < ?
+         ON CONFLICT(save_id, year, season, species_id, method) DO NOTHING`
+      )
+      .run(
+        save.id,
+        save.year,
+        save.season,
+        speciesId,
+        method,
+        limit,
+        JSON.stringify(factors),
+        now,
+        now,
+        save.id,
+        save.year,
+        save.season,
+        speciesId,
+        method,
+        limit
+      );
+    if (Number(insert.changes) === 1) {
+      const row = this.getQuotaLedger(save.id, save.year, save.season, speciesId, method);
+      if (row) {
+        return row;
+      }
+    }
+
+    const existing = this.getQuotaLedger(save.id, save.year, save.season, speciesId, method);
+    if (existing) {
+      const granted = Number(existing.quota_granted);
+      if (used < granted) {
+        return existing;
+      }
+      // 恢复对账：只上调，不回收已授予额度。
+      if (limit > granted) {
+        this.store.db
+          .prepare(
+            `UPDATE sample_quota_ledger SET quota_granted = ?, factors_json = ?, updated_at = ?
+             WHERE save_id = ? AND year = ? AND season = ? AND species_id = ? AND method = ?`
+          )
+          .run(
+            limit,
+            JSON.stringify(factors),
+            now,
+            save.id,
+            save.year,
+            save.season,
+            speciesId,
+            method
+          );
+        const refreshed = this.getQuotaLedger(save.id, save.year, save.season, speciesId, method);
+        if (refreshed) {
+          return refreshed;
+        }
+      }
+    }
+
+    throw new AppError(
+      'QUOTA_EXHAUSTED',
+      `${SAMPLE_LABELS[method]} 本季配额已用尽，无法继续取样`,
+      409,
+      { used, limit: existing?.quota_granted ?? limit },
+      true
+    );
+  }
+
+  /**
+   * 以 samples 表（样本事实）为唯一真相，重建当前季缺失/漂移的配额账本。
+   * 仅在存档导入、读取旧档等“恢复”路径调用；正常采集路径由 grantQuota 原子写入。
+   * 已存在且不低于历史用量的账本保持不动，保证已授予配额不会被悄悄回收。
+   */
+  private reconcileCurrentSeasonQuota(save: SaveRecord): { repaired: number } {
+    const states = this.getSpeciesStates(save.id, save.year);
+    const siteMap = new Map(this.getSiteStates(save.id, save.year).map((site) => [site.siteId, site]));
+    const methods = SAMPLE_METHODS.filter((method) => method !== PHOTO_METHOD);
+    // 批量预载：当前季真实样本计数与已有账本，避免在命令热路径上逐行查询。
+    const countRows = this.store.db
+      .prepare(
+        `SELECT species_id, method, COUNT(*) AS used
+         FROM samples WHERE save_id = ? AND year = ? AND season = ? AND method != 'photo'
+         GROUP BY species_id, method`
+      )
+      .all(save.id, save.year, save.season) as unknown as Array<{ species_id: string; method: SampleMethod; used: number }>;
+    const usageByKey = new Map(countRows.map((row) => [ledgerKey(row.species_id, row.method), Number(row.used)]));
+    const ledgerByKey = this.getSeasonQuotaLedger(save.id, save.year, save.season);
+    // 热路径快路：本季尚无破坏性样本、也无账本时（新季的第一条 MOVE/WAIT/OBSERVE 命令），无需遍历物种。
+    if (usageByKey.size === 0 && ledgerByKey.size === 0) {
+      return { repaired: 0 };
+    }
+    let repaired = 0;
+
+    for (const state of states) {
+      const definition = SPECIES_BY_ID.get(state.speciesId);
+      const site = siteMap.get(state.siteId);
+      if (!definition || !site) {
+        continue;
+      }
+      for (const method of methods) {
+        const key = ledgerKey(state.speciesId, method);
+        const used = usageByKey.get(key) ?? 0;
+        const existing = ledgerByKey.get(key);
+        if (used === 0 && !existing) {
+          continue;
+        }
+        const computed = computeSampleQuota({
+          method,
+          definition,
+          state,
+          site,
+          season: save.season,
+          day: save.day,
+          used
+        });
+        const grant = Math.max(computed.limit, used);
+        if (existing && Number(existing.quota_granted) >= used) {
+          continue;
+        }
+        const now = new Date().toISOString();
+        this.store.db
+          .prepare(
+            `INSERT INTO sample_quota_ledger
+               (save_id, year, season, species_id, method, quota_granted, factors_json, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(save_id, year, season, species_id, method) DO UPDATE SET
+               quota_granted = MAX(excluded.quota_granted, sample_quota_ledger.quota_granted),
+               updated_at = excluded.updated_at`
+          )
+          .run(
+            save.id,
+            save.year,
+            save.season,
+            state.speciesId,
+            method,
+            grant,
+            JSON.stringify(computed.factors),
+            now,
+            now
+          );
+        repaired += 1;
+      }
+    }
+    return { repaired };
+  }
+
+  /** 提交前全量配额不变量：任意非拍照计数都不得超过其授予配额。 */
+  private verifyQuotaInvariants(save: SaveRecord): void {
+    const violations = this.store.db
+      .prepare(
+        `SELECT s.species_id, s.method, COUNT(*) AS consumed,
+                COALESCE(l.quota_granted, 0) AS granted
+         FROM samples s
+         LEFT JOIN sample_quota_ledger l
+           ON l.save_id = s.save_id AND l.year = s.year AND l.season = s.season
+          AND l.species_id = s.species_id AND l.method = s.method
+         WHERE s.save_id = ? AND s.year = ? AND s.season = ? AND s.method != 'photo'
+         GROUP BY s.species_id, s.method
+         HAVING consumed > granted`
+      )
+      .all(save.id, save.year, save.season) as unknown as Array<{
+      species_id: string;
+      method: SampleMethod;
+      consumed: number;
+      granted: number;
+    }>;
+    if (violations.length > 0) {
+      throw new AppError(
+        'QUOTA_INVARIANT_VIOLATION',
+        '检测到采集样本超出本季授予配额，事务必须回滚',
+        500,
+        { violations },
+        false
+      );
+    }
+  }
 }
 
 function rowToSiteState(row: SiteStateRow): SiteState {
@@ -1554,6 +1887,35 @@ export function hashToken(token: string): string {
 
 function stateKey(state: SpeciesState): string {
   return `${state.siteId}:${state.speciesId}`;
+}
+
+function ledgerKey(speciesId: string, method: SampleMethod): string {
+  return `${speciesId}:${method}`;
+}
+
+function parseLedgerFactors(row: LedgerRow | null | undefined): QuotaFactors | undefined {
+  if (!row) {
+    return undefined;
+  }
+  const parsed = parseJson<Partial<QuotaFactors>>(row.factors_json, {});
+  if (
+    typeof parsed.base === 'number' &&
+    typeof parsed.phenology === 'number' &&
+    typeof parsed.protection === 'number' &&
+    typeof parsed.occupancy === 'number' &&
+    typeof parsed.disturbance === 'number'
+  ) {
+    return parsed as QuotaFactors;
+  }
+  return undefined;
+}
+
+/** 评估调用所需的钉住配额：账本存在时连同原始系数一起传入。 */
+function pinnedQuotaFrom(row: LedgerRow | null | undefined): { limit: number; factors?: QuotaFactors } | undefined {
+  if (!row) {
+    return undefined;
+  }
+  return { limit: Number(row.quota_granted), factors: parseLedgerFactors(row) };
 }
 
 function percentChange(start: number, end: number): number {
