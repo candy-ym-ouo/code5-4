@@ -193,15 +193,22 @@ export function PlayPage() {
                     <h2>采集方式</h2>
                   </div>
                 </div>
-                <p className="helper-text">绿色表示安全且当前可用。错误协议仍可能执行，但会真实影响生态。</p>
+                <p className="helper-text">
+                  配额按物候期、保护级别和区域承载力每季调整。绿色表示安全且当前可用；错误协议仍可能执行，但会真实影响生态。
+                </p>
                 <div className="sample-grid">
                   {(Object.keys(SAMPLE_LABELS) as SampleMethod[]).map((method) => {
                     const limit = selectedSpecies?.sampleLimits[method];
+                    const factors = limit?.factors;
+                    const factorTitle = factors
+                      ? `物候 ×${factors.phenology.toFixed(2)} · 保护 ×${factors.protection.toFixed(2)} · 承载力 ×${factors.carryingCapacity.toFixed(2)}`
+                      : undefined;
                     return (
                       <button
                         key={method}
                         type="button"
                         className="sample-button"
+                        title={factorTitle}
                         disabled={pending || !selectedSpecies || !limit?.allowed}
                         onClick={() => {
                           if (selectedSpecies) void run({ type: 'TAKE_SAMPLE', speciesId: selectedSpecies.id, method });

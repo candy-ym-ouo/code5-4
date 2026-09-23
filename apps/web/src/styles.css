@@ -33,6 +33,7 @@ code { font-family: "SFMono-Regular", Consolas, monospace; }
 .eyebrow { margin: 0 0 .45rem; color: var(--moss); font-family: "SFMono-Regular", Consolas, monospace; font-size: .7rem; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
 .positive { color: #31734e !important; }
 .negative { color: var(--red) !important; }
+.neutral { color: var(--muted) !important; }
 .empty-copy { color: var(--muted); padding: 1.4rem 0; }
 
 .button {
@@ -237,6 +238,15 @@ code { font-family: "SFMono-Regular", Consolas, monospace; }
 .habitat-status { position: absolute; top: 1rem; left: 1rem; display: grid; padding: .55rem .7rem; border-radius: 3px; background: rgba(255, 255, 255, .75); }
 .habitat-status span { color: var(--muted); font-size: .65rem; }
 .text-link { color: var(--moss); font-weight: 800; }
+.text-link-button {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.text-link-button:disabled { color: var(--muted); cursor: not-allowed; text-decoration: none; }
 .notebook-sheet { position: relative; padding: clamp(1.3rem, 3vw, 2.4rem); background: linear-gradient(90deg, transparent 0 3.9rem, rgba(181, 78, 62, .17) 3.9rem 3.95rem, transparent 3.95rem), repeating-linear-gradient(0deg, transparent 0 31px, rgba(86, 109, 93, .1) 31px 32px), #fffdf5; }
 .sheet-heading { display: flex; justify-content: space-between; gap: 1rem; align-items: flex-start; margin-left: 1.3rem; }
 .sheet-heading h2 { font-size: 2.1rem; margin-bottom: .25rem; }

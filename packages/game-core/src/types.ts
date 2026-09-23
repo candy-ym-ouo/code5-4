@@ -102,6 +102,19 @@ export interface SampleDecision {
   messages: string[];
 }
 
+export interface QuotaFactors {
+  phenology: number;
+  protection: number;
+  carryingCapacity: number;
+}
+
+export interface SeasonQuota {
+  method: SampleMethod;
+  base: number;
+  quota: number;
+  factors: QuotaFactors;
+}
+
 export interface SeasonEvolutionResult {
   state: SpeciesState;
   populationChange: number;

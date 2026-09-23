@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { SPECIES, SPECIES_BY_ID } from './catalog.ts';
 import {
   applyOverwinter,
+  computeSeasonQuota,
   createSpeciesState,
   disperseSpecies,
   evaluateSample,
@@ -23,7 +24,7 @@ describe('deterministic world simulation', () => {
     const species = SPECIES_BY_ID.get('prunus-davidiana')!;
     const site = generateSiteState('save', 'seed-beta', 1, 'spring', 3, 'foothill');
     const state = createSpeciesState('save', 'seed-beta', 1, 'spring', 'foothill', species.id);
-    const decision = evaluateSample(species, state, site, 'spring', 3, 'litter', 0);
+    const decision = evaluateSample(species, state, site, 'spring', 3, 'litter');
     expect(decision.allowed).toBe(true);
     expect(decision.protocolMatch).toBe(false);
     expect(decision.effects.health).toBeLessThan(0);
@@ -76,14 +77,60 @@ describe('catalog-wide stability', () => {
   });
 });
 
+describe('dynamic seasonal quotas', () => {
+  it('expands photo quota beyond the old fixed 99 cap and keeps it stable', () => {
+    const species = SPECIES_BY_ID.get('prunus-davidiana')!;
+    const state = createSpeciesState('save', 'quota-seed', 1, 'spring', 'foothill', species.id);
+    for (const season of ['spring', 'summer', 'autumn', 'winter'] as const) {
+      const plan = computeSeasonQuota(species, state, season, 'photo');
+      expect(plan.base).toBe(12);
+      expect(plan.factors.phenology).toBe(1);
+      expect(plan.factors.protection).toBe(1);
+      expect(plan.quota).toBeGreaterThanOrEqual(6);
+    }
+  });
+
+  it('varies destructive quotas by phenological stage weight', () => {
+    const species = SPECIES_BY_ID.get('liquidambar-formosana')!;
+    const state = createSpeciesState('save', 'quota-seed', 1, 'autumn', 'ridge', species.id);
+    const autumnLitter = computeSeasonQuota(species, state, 'autumn', 'litter');
+    const springLitter = computeSeasonQuota(species, state, 'spring', 'litter');
+    expect(autumnLitter.factors.phenology).toBeGreaterThan(springLitter.factors.phenology);
+    expect(autumnLitter.quota).toBeGreaterThan(springLitter.quota);
+  });
+
+  it('shrinks quotas with protection level and bans cutting protected species', () => {
+    const species = SPECIES_BY_ID.get('metasequoia-glyptostroboides')!;
+    const state = createSpeciesState('save', 'quota-seed', 1, 'spring', 'stream_valley', species.id);
+    const rubbing = computeSeasonQuota(species, state, 'spring', 'rubbing');
+    const cutting = computeSeasonQuota(species, state, 'spring', 'cutting');
+    expect(rubbing.factors.protection).toBe(0.5);
+    expect(cutting.factors.protection).toBe(0);
+    expect(cutting.quota).toBe(0);
+    expect(computeSeasonQuota(species, state, 'spring', 'photo').factors.protection).toBe(1);
+  });
+
+  it('scales quotas with regional carrying capacity pressure', () => {
+    const species = SPECIES_BY_ID.get('prunus-davidiana')!;
+    const abundant = {
+      ...createSpeciesState('save', 'quota-seed', 1, 'spring', 'foothill', species.id),
+      population: species.zones.foothill!.carryingCapacity
+    };
+    const depleted = { ...abundant, population: Math.round(species.zones.foothill!.carryingCapacity * 0.1) };
+    const high = computeSeasonQuota(species, abundant, 'spring', 'cutting');
+    const low = computeSeasonQuota(species, depleted, 'spring', 'cutting');
+    expect(high.factors.carryingCapacity).toBeGreaterThan(low.factors.carryingCapacity);
+  });
+});
+
 describe('sampling safety', () => {
   it('does not allow destructive sampling on protected species', () => {
     const species = SPECIES_BY_ID.get('metasequoia-glyptostroboides')!;
     const site = generateSiteState('save', 'protected-seed', 1, 'spring', 5, 'stream_valley');
     const state = createSpeciesState('save', 'protected-seed', 1, 'spring', 'stream_valley', species.id);
-    expect(evaluateSample(species, state, site, 'spring', 5, 'litter', 0).allowed).toBe(false);
-    expect(evaluateSample(species, state, site, 'spring', 5, 'cutting', 0).allowed).toBe(false);
-    expect(evaluateSample(species, state, site, 'spring', 5, 'photo', 0).allowed).toBe(true);
+    expect(evaluateSample(species, state, site, 'spring', 5, 'litter').allowed).toBe(false);
+    expect(evaluateSample(species, state, site, 'spring', 5, 'cutting').allowed).toBe(false);
+    expect(evaluateSample(species, state, site, 'spring', 5, 'photo').allowed).toBe(true);
   });
 });
 

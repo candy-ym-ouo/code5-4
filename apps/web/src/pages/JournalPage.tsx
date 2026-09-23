@@ -6,12 +6,16 @@ import { api } from '../api.ts';
 import { useGame } from '../game-context.tsx';
 
 export function JournalPage() {
-  const { world } = useGame();
+  const { world, execute, pending } = useGame();
   const [season, setSeason] = useState<Season | ''>('');
   const journal = useQuery({
     queryKey: ['journal', world.saveId, season],
     queryFn: () => api.getJournal(world.saveId, season ? { season } : {})
   });
+
+  const revoke = async (sampleId: string) => {
+    await execute({ type: 'REVOKE_SAMPLE', sampleId });
+  };
 
   return (
     <div className="document-page">
@@ -62,14 +66,33 @@ export function JournalPage() {
             {entry.kind === 'sample' && (
               <div className="journal-values">
                 <span>{String(entry.details.methodLabel)}</span>
-                <span className={entry.details.protocolMatch ? 'positive' : 'negative'}>
-                  {entry.details.protocolMatch ? '符合协议' : '不符合协议'}
-                </span>
+                {entry.details.revoked ? (
+                  <span className="neutral">已撤销 · 生态影响已逆转</span>
+                ) : (
+                  <span className={entry.details.protocolMatch ? 'positive' : 'negative'}>
+                    {entry.details.protocolMatch ? '符合协议' : '不符合协议'}
+                  </span>
+                )}
               </div>
             )}
             {entry.note && <p>{entry.note}</p>}
             <footer>
               <time>{new Date(entry.createdAt).toLocaleString('zh-CN', { hour12: false })}</time>
+              {entry.kind === 'sample' &&
+                !entry.details.revoked &&
+                entry.year === world.year &&
+                entry.season === world.season &&
+                world.phase === 'active' && (
+                  <button
+                    type="button"
+                    className="text-link text-link-button"
+                    disabled={pending}
+                    onClick={() => void revoke(entry.id)}
+                    title="当季可撤销：样本标记作废，配额归还，生态影响逆转"
+                  >
+                    撤销采集
+                  </button>
+                )}
               {entry.speciesId && <Link to={`/play/species/${entry.speciesId}`}>物种档案 →</Link>}
             </footer>
           </article>

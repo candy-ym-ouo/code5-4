@@ -6,13 +6,21 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:net';
 
+import { createRequire } from 'node:module';
+
 const root = path.resolve(import.meta.dirname, '..');
+const requireFromServer = createRequire(path.join(root, 'apps/server/package.json'));
+const tsxLoader = requireFromServer.resolve('tsx');
+
 const runtime = await mkdtemp(path.join(tmpdir(), 'shanhai-e2e-'));
 const databasePath = path.join(runtime, 'e2e.db');
 const port = await getAvailablePort();
 const baseUrl = `http://127.0.0.1:${port}`;
 
-const child = spawn(process.execPath, [path.join(root, 'apps/server/dist/index.js')], {
+const child = spawn(
+  process.execPath,
+  ['--disable-warning=ExperimentalWarning', '--import', tsxLoader, path.join(root, 'apps/server/dist/index.js')],
+  {
   cwd: root,
   env: {
     ...process.env,

@@ -1,9 +1,11 @@
-import type { SampleMethod, Season, SiteId } from '@shanhai/contracts';
+import type { PhenologyStage, SampleMethod, Season, SiteId } from '@shanhai/contracts';
 import { SPECIES_BY_ID, SITES_BY_ID } from './catalog.ts';
 import { createRng } from './rng.ts';
 import type {
   PlantPresentation,
+  QuotaFactors,
   SampleDecision,
+  SeasonQuota,
   SeasonEvolutionResult,
   SiteState,
   SpeciesDefinition,
@@ -56,13 +58,6 @@ const WEATHER_LIGHT_OFFSET: Record<string, number> = {
   heavy_rain: 0.28,
   fog: 0.35,
   snow: 0.45
-};
-
-const SAMPLE_LABELS: Record<SampleMethod, string> = {
-  photo: '拍照',
-  rubbing: '拓印',
-  litter: '落叶采集',
-  cutting: '标准剪取'
 };
 
 const STAGE_LABELS = {
@@ -371,32 +366,143 @@ export function getStatus(population: number, carryingCapacity: number, health: 
   return 'stable';
 }
 
+export const BASE_SAMPLE_QUOTA: Record<SampleMethod, number> = {
+  photo: 12,
+  rubbing: 3,
+  litter: 3,
+  cutting: 1
+};
+
+/** 各采集方式在不同物候阶段的适宜度权重（季内平均后形成物候期系数）。 */
+const PHENOLOGY_WEIGHTS: Record<SampleMethod, Partial<Record<PhenologyStage, number>>> = {
+  photo: {},
+  rubbing: {
+    budding: 0.4,
+    leafing: 0.4,
+    early_bloom: 1,
+    full_bloom: 1,
+    late_bloom: 1,
+    fruiting: 0.9,
+    leaf_color: 0.9,
+    leaf_fall: 0.5,
+    dormant: 0.3
+  },
+  litter: {
+    budding: 0.1,
+    leafing: 0.1,
+    early_bloom: 0.2,
+    full_bloom: 0.2,
+    late_bloom: 0.4,
+    fruiting: 0.6,
+    leaf_color: 0.9,
+    leaf_fall: 1,
+    dormant: 0.9
+  },
+  cutting: {
+    budding: 0.3,
+    leafing: 0.6,
+    early_bloom: 0.4,
+    full_bloom: 0.3,
+    late_bloom: 0.5,
+    fruiting: 0.8,
+    leaf_color: 0.7,
+    leaf_fall: 0.5,
+    dormant: 0.2
+  }
+};
+
+/**
+ * 物候期系数：遍历该季 10 天，取各日物候阶段对应权重的平均值。
+ * 影像记录不受物候限制，恒为 1。
+ */
+export function phenologyQuotaFactor(
+  definition: SpeciesDefinition,
+  state: SpeciesState,
+  season: Season,
+  method: SampleMethod
+): number {
+  if (method === 'photo') {
+    return 1;
+  }
+  const weights = PHENOLOGY_WEIGHTS[method]!;
+  let sum = 0;
+  for (let day = 1; day <= 10; day += 1) {
+    const stage = getPlantPresentation(definition, state, season, day).stage;
+    sum += weights[stage] ?? 0.5;
+  }
+  return clamp(sum / 10, 0.1, 1);
+}
+
+/**
+ * 保护级别系数：保护物种的非破坏性采集额度减半，标准剪取恒为 0（禁止）。
+ * 普通物种不受保护级别影响。
+ */
+export function protectionQuotaFactor(definition: SpeciesDefinition, method: SampleMethod): number {
+  if (!definition.protected) {
+    return 1;
+  }
+  if (method === 'cutting') {
+    return 0;
+  }
+  if (method === 'photo') {
+    return 1;
+  }
+  return 0.5;
+}
+
+/**
+ * 区域承载力系数：以当前种群相对承载量的比例衡量该区域还能承受多少采集。
+ * 比例在 50% 以下时系数为 0.5，50%~100% 线性回升到 1，超过承载量时最高 1.2。
+ */
+export function carryingCapacityQuotaFactor(
+  state: SpeciesState,
+  carryingCapacity: number
+): number {
+  const ratio = state.population / Math.max(1, carryingCapacity);
+  return clamp(0.5 + ratio, 0.5, 1.2);
+}
+
+/**
+ * 计算某物种在某区域某一季、某采集方式的动态安全配额。
+ * 配额 = 基础额度 × 物候期系数 × 保护级别系数 × 区域承载力系数，
+ * 非影像方式至少保留 1 次（配额为 0 时由协议/保护规则显式拒绝并给出原因）。
+ */
+export function computeSeasonQuota(
+  definition: SpeciesDefinition,
+  state: SpeciesState,
+  season: Season,
+  method: SampleMethod
+): SeasonQuota {
+  const profile = definition.zones[state.siteId];
+  const factors: QuotaFactors = {
+    phenology: phenologyQuotaFactor(definition, state, season, method),
+    protection: protectionQuotaFactor(definition, method),
+    carryingCapacity: profile ? carryingCapacityQuotaFactor(state, profile.carryingCapacity) : 0.5
+  };
+  const base = BASE_SAMPLE_QUOTA[method];
+  const raw = base * factors.phenology * factors.protection * factors.carryingCapacity;
+  let quota = Math.round(raw);
+
+  if (!profile) {
+    quota = 0;
+  } else if (factors.protection === 0) {
+    quota = 0;
+  } else if (method !== 'photo' && quota < 1 && raw > 0) {
+    quota = 1;
+  }
+
+  return { method, base, quota, factors };
+}
+
 export function evaluateSample(
   definition: SpeciesDefinition,
   state: SpeciesState,
   site: SiteState,
   season: Season,
   day: number,
-  method: SampleMethod,
-  used: number
+  method: SampleMethod
 ): SampleDecision {
-  const limits: Record<SampleMethod, number> = {
-    photo: 99,
-    rubbing: 3,
-    litter: 3,
-    cutting: 1
-  };
   const emptyEffects = { health: 0, populationDelta: 0, seedBankDelta: 0 };
-
-  if (used >= limits[method]) {
-    return {
-      allowed: false,
-      reason: `${SAMPLE_LABELS[method]} 已达到本季安全上限`,
-      protocolMatch: false,
-      effects: emptyEffects,
-      messages: []
-    };
-  }
 
   const profile = definition.zones[site.siteId];
   if (!profile) {

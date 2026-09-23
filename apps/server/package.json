@@ -9,7 +9,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "db:init": "tsx src/scripts/init-db.ts",
-    "start": "node --disable-warning=ExperimentalWarning dist/index.js"
+    "start": "node --import tsx --disable-warning=ExperimentalWarning dist/index.js"
   },
   "dependencies": {
     "@shanhai/contracts": "file:../../packages/contracts",
@@ -19,7 +19,8 @@
     "express": "^5.1.0",
     "helmet": "^8.1.0",
     "pino": "^9.7.0",
-    "pino-http": "^10.5.0"
+    "pino-http": "^10.5.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/cookie-parser": "^1.4.9",

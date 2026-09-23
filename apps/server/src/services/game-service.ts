@@ -12,11 +12,13 @@ import type {
   SpeciesSnapshot,
   WorldSnapshot
 } from '@shanhai/contracts';
-import { SEASON_LABELS } from '@shanhai/contracts';
+import { SEASON_LABELS, SAMPLE_METHODS } from '@shanhai/contracts';
 import {
   applyOverwinter,
   applySampleEffects,
   CATALOG_VERSION,
+  clamp,
+  computeSeasonQuota,
   createSpeciesState,
   disperseSpecies,
   evaluateSample,
@@ -92,6 +94,33 @@ interface EventRow {
   created_at: string;
 }
 
+interface SampleRow {
+  id: string;
+  save_id: string;
+  year: number;
+  season: Season;
+  day: number;
+  slot: number;
+  site_id: SiteId;
+  species_id: string;
+  method: SampleMethod;
+  protocol_match: number;
+  effects_json: string;
+  revoked: number;
+}
+
+interface QuotaRow {
+  save_id: string;
+  year: number;
+  season: Season;
+  site_id: SiteId;
+  species_id: string;
+  method: SampleMethod;
+  quota: number;
+  used: number;
+  quota_json: string;
+}
+
 interface EventDraft {
   type: string;
   message: string;
@@ -109,13 +138,6 @@ interface SessionRecord {
   token_hash: string;
 }
 
-const SAMPLE_LIMITS: Record<SampleMethod, number> = {
-  photo: 99,
-  rubbing: 3,
-  litter: 3,
-  cutting: 1
-};
-
 const SAMPLE_LABELS: Record<SampleMethod, string> = {
   photo: '拍照',
   rubbing: '拓印',
@@ -131,6 +153,12 @@ const RESTORATION_LABELS: Record<string, string> = {
 };
 
 export class GameService {
+  /**
+   * 测试用故障注入开关：打开后，采集命令在“配额已占位、生态已写入、样本未落库”处抛错，
+   * 用于验证外层事务会把台账占用与生态影响一并回滚。生产路径永远不会打开。
+   */
+  crashAfterQuotaReservation = false;
+
   constructor(private readonly store: Store) {}
 
   createSession(tokenHash: string): string {
@@ -262,6 +290,7 @@ export class GameService {
           method: String(row.method),
           methodLabel: SAMPLE_LABELS[String(row.method) as SampleMethod] ?? String(row.method),
           protocolMatch: Boolean(row.protocol_match),
+          revoked: Boolean(row.revoked),
           effects: parseJson<Record<string, unknown>>(String(row.effects_json), {})
         }
       });
@@ -309,7 +338,7 @@ export class GameService {
         colors: definition.colors
       },
       states: states.map((state) => ({
-        ...this.toSpeciesSnapshot(save, state, new Map()),
+        ...this.toSpeciesSnapshot(save, state, new Map<string, { used: number; limit: number }>()),
         siteId: state.siteId,
         siteName: SITES_BY_ID.get(state.siteId)?.name ?? state.siteId
       })),
@@ -483,6 +512,7 @@ export class GameService {
     }
     save.year_start_sites_json = JSON.stringify(siteStates);
     save.year_start_species_json = JSON.stringify(speciesStates);
+    this.seedSeasonQuotas(save, speciesStates);
   }
 
   private regenerateEnvironments(save: SaveRecord): void {
@@ -532,6 +562,8 @@ export class GameService {
         return this.recordEnvironment(save, command.values);
       case 'TAKE_SAMPLE':
         return this.takeSample(save, command.speciesId, command.method);
+      case 'REVOKE_SAMPLE':
+        return this.revokeSample(save, command.sampleId);
       case 'RESTORE_HABITAT':
         return this.restoreHabitat(save, command.speciesId, command.action);
       case 'END_SEASON':
@@ -689,12 +721,38 @@ export class GameService {
     if (!definition || !state || !site || state.population <= 1) {
       throw new AppError('SPECIES_NOT_VISIBLE', '当前区域没有可采集的目标物种', 409);
     }
-    const used = this.countSamples(save.id, save.year, save.season, speciesId, method);
-    const decision = evaluateSample(definition, state, site, save.season, save.day, method, used);
+    const decision = evaluateSample(definition, state, site, save.season, save.day, method);
     if (!decision.allowed) {
       throw new AppError('SAMPLE_LIMIT_REACHED', decision.reason ?? '当前不能执行采集', 409);
     }
 
+    // 先确保本季台账存在（旧存档恢复时惰性补建），再原子占位：
+    // 条件 UPDATE 保证并发请求中只有 used < quota 的一方成功，绝不超采。
+    const quota = this.ensureSeasonQuota(save, state, method);
+    if (quota <= 0) {
+      throw new AppError('SAMPLE_LIMIT_REACHED', `${SAMPLE_LABELS[method]} 本季配额为 0，禁止采集`, 409);
+    }
+    const reservation = this.store.db
+      .prepare(
+        `UPDATE sample_quotas
+         SET used = used + 1
+         WHERE save_id = ? AND year = ? AND season = ? AND site_id = ? AND species_id = ? AND method = ?
+           AND used < quota`
+      )
+      .run(
+        save.id,
+        save.year,
+        save.season,
+        save.current_site_id,
+        speciesId,
+        method
+      );
+    if (reservation.changes !== 1) {
+      throw new AppError('SAMPLE_LIMIT_REACHED', `${SAMPLE_LABELS[method]} 已达到本季安全配额`, 409);
+    }
+
+    // 此后任何一步失败都会由外层 BEGIN IMMEDIATE 事务整体回滚，
+    // 台账占位、样本记录与生态影响始终保持原子一致。
     const nextState = applySampleEffects(state, decision, save.current_site_id);
     this.upsertSpeciesState(nextState);
     if (nextState.health < state.health || nextState.population < state.population) {
@@ -702,13 +760,17 @@ export class GameService {
       this.upsertSiteState(site);
     }
 
+    if (this.crashAfterQuotaReservation) {
+      throw new AppError('SIMULATED_CRASH', '测试用故障注入：生态写入后中断', 500);
+    }
+
     const id = randomUUID();
     this.store.db
       .prepare(
         `INSERT INTO samples
          (id, save_id, observation_id, year, season, day, slot, site_id, species_id, method,
-          protocol_match, effects_json, created_at)
-         VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          protocol_match, effects_json, revoked, created_at)
+         VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
       )
       .run(
         id,
@@ -745,6 +807,84 @@ export class GameService {
       },
       evaluation: decision
     };
+  }
+
+  private revokeSample(save: SaveRecord, sampleId: string): CommandOutcome {
+    this.requireActive(save);
+    const row = this.store.db
+      .prepare('SELECT * FROM samples WHERE id = ? AND save_id = ?')
+      .get(sampleId, save.id) as unknown as SampleRow | undefined;
+    if (!row) {
+      throw new AppError('SAMPLE_NOT_FOUND', '未找到要撤销的采集记录', 404);
+    }
+    if (row.revoked) {
+      throw new AppError('SAMPLE_ALREADY_REVOKED', '该采集记录已经撤销', 409);
+    }
+    // 跨季冻结：季节一旦结算，生态影响已进入演化闭环，只能在同季 active 阶段撤销。
+    if (row.year !== save.year || row.season !== save.season) {
+      throw new AppError(
+        'SAMPLE_REVOKE_LOCKED',
+        '跨季采集已进入季节结算，不能撤销；请在当季内撤销',
+        409
+      );
+    }
+
+    const definition = SPECIES_BY_ID.get(row.species_id);
+    const state = this.getSpeciesState(save.id, save.year, row.site_id, row.species_id);
+    const site = this.getSiteState(save.id, save.year, row.site_id);
+    if (!definition || !state || !site) {
+      throw new AppError('SAMPLE_NOT_FOUND', '采集记录对应的生态状态缺失', 409);
+    }
+
+    const recorded = parseJson<{ health: number; populationDelta: number; seedBankDelta: number }>(
+      row.effects_json,
+      { health: 0, populationDelta: 0, seedBankDelta: 0 }
+    );
+    const profile = definition.zones[row.site_id]!;
+
+    // 原子逆转生态影响（健康/种群/种子库），并恢复区域干扰。
+    const reverted: SpeciesState = {
+      ...state,
+      population: round(Math.max(0, state.population - recorded.populationDelta), 2),
+      health: round(clamp(state.health - recorded.health, 0, 100), 1),
+      seedBank: round(Math.max(0, state.seedBank - recorded.seedBankDelta), 2)
+    };
+    reverted.status = getStatus(reverted.population, profile.carryingCapacity, reverted.health);
+    this.upsertSpeciesState(reverted);
+
+    if (recorded.health < 0 || recorded.populationDelta < 0) {
+      site.disturbance = round(Math.max(0, site.disturbance - 0.0035), 4);
+      this.upsertSiteState(site);
+    }
+
+    const markResult = this.store.db
+      .prepare('UPDATE samples SET revoked = 1 WHERE id = ? AND revoked = 0')
+      .run(sampleId);
+    if (markResult.changes !== 1) {
+      throw new AppError('SAMPLE_ALREADY_REVOKED', '该采集记录已经撤销', 409);
+    }
+
+    // 原子归还配额：仅当台账存在且 used > 0 时归还一行。
+    const release = this.store.db
+      .prepare(
+        `UPDATE sample_quotas
+         SET used = used - 1
+         WHERE save_id = ? AND year = ? AND season = ? AND site_id = ? AND species_id = ? AND method = ?
+           AND used > 0`
+      )
+      .run(save.id, row.year, row.season, row.site_id, row.species_id, row.method);
+    if (release.changes !== 1) {
+      throw new AppError('QUOTA_LEDGER_MISMATCH', '配额台账与样本记录不一致，撤销已中止', 500);
+    }
+
+    return {
+      event: {
+        type: 'REVOKE_SAMPLE',
+        message: `已撤销${definition.name}的${SAMPLE_LABELS[row.method]}`,
+        effects: ['生态影响已按原记录逆转', '本季安全配额已归还', '撤销不消耗行动点'],
+        payload: { sampleId, speciesId: row.species_id, method: row.method }
+      }
+    }
   }
 
   private restoreHabitat(
@@ -829,6 +969,7 @@ export class GameService {
     save.action_points = 30;
     save.phase = 'active';
     this.regenerateEnvironments(save);
+    this.seedSeasonQuotas(save, this.getSpeciesStates(save.id, save.year));
     return {
       event: {
         type: 'BEGIN_NEXT_SEASON',
@@ -908,6 +1049,7 @@ export class GameService {
     save.phase = 'active';
     save.year_start_species_json = JSON.stringify(dispersedSpecies);
     save.year_start_sites_json = JSON.stringify(nextSites);
+    this.seedSeasonQuotas(save, dispersedSpecies);
     return {
       event: {
         type: 'BEGIN_NEXT_YEAR',
@@ -947,7 +1089,7 @@ export class GameService {
       .prepare(
         `SELECT COUNT(*) AS count,
                 COALESCE(SUM(CASE WHEN protocol_match = 0 THEN 1 ELSE 0 END), 0) AS incorrect
-         FROM samples WHERE save_id = ? AND year = ? AND season = ?`
+         FROM samples WHERE save_id = ? AND year = ? AND season = ? AND revoked = 0`
       )
       .get(save.id, save.year, save.season) as unknown as { count: number; incorrect: number };
 
@@ -1074,7 +1216,9 @@ export class GameService {
     const incorrectSamples = Number(
       (
         this.store.db
-          .prepare('SELECT COUNT(*) AS count FROM samples WHERE save_id = ? AND year = ? AND protocol_match = 0')
+          .prepare(
+            'SELECT COUNT(*) AS count FROM samples WHERE save_id = ? AND year = ? AND protocol_match = 0 AND revoked = 0'
+          )
           .get(save.id, save.year) as unknown as { count: number }
       ).count
     );
@@ -1125,16 +1269,14 @@ export class GameService {
       speciesBySite.set(state.siteId, list);
     }
 
-    const sampleCounts = this.store.db
-      .prepare(
-        `SELECT species_id, method, COUNT(*) AS used
-         FROM samples WHERE save_id = ? AND year = ? AND season = ?
-         GROUP BY species_id, method`
-      )
-      .all(save.id, save.year, save.season) as unknown as Array<{ species_id: string; method: SampleMethod; used: number }>;
-    const sampleUsage = new Map<string, number>();
-    for (const row of sampleCounts) {
-      sampleUsage.set(`${row.species_id}:${row.method}`, Number(row.used));
+    // 配额用量以台账为准（撤销样本会归还占用），与采集实际授权严格一致。
+    const quotaRows = this.getQuotaRows(save.id, save.year, save.season);
+    const sampleUsage = new Map<string, { used: number; limit: number }>();
+    for (const row of quotaRows) {
+      sampleUsage.set(`${row.site_id}:${row.species_id}:${row.method}`, {
+        used: Number(row.used),
+        limit: Number(row.quota)
+      });
     }
     const unlockCounts = this.store.db
       .prepare(
@@ -1213,7 +1355,11 @@ export class GameService {
     };
   }
 
-  private toSpeciesSnapshot(save: SaveRecord, state: SpeciesState, sampleUsage: Map<string, number>): SpeciesSnapshot {
+  private toSpeciesSnapshot(
+    save: SaveRecord,
+    state: SpeciesState,
+    sampleUsage: Map<string, { used: number; limit: number }>
+  ): SpeciesSnapshot {
     const definition = SPECIES_BY_ID.get(state.speciesId);
     if (!definition) {
       throw new Error(`Missing species definition ${state.speciesId}`);
@@ -1223,18 +1369,33 @@ export class GameService {
     const effectivePhenology = getPhenologyWindow(definition, state, save.season);
     const site = this.getSiteState(save.id, save.year, state.siteId);
     const sampleLimits = Object.fromEntries(
-      (Object.keys(SAMPLE_LIMITS) as SampleMethod[]).map((method) => {
-        const used = sampleUsage.get(`${state.speciesId}:${method}`) ?? 0;
+      SAMPLE_METHODS.map((method) => {
+        const plan = computeSeasonQuota(definition, state, save.season, method);
+        const ledger = sampleUsage.get(`${state.siteId}:${state.speciesId}:${method}`);
+        const used = ledger?.used ?? 0;
+        const limit = ledger?.limit ?? plan.quota;
+        // 快照中的可用性同时反映协议/安全规则与配额余量。
         const decision = site
-          ? evaluateSample(definition, state, site, save.season, save.day, method, used)
+          ? evaluateSample(definition, state, site, save.season, save.day, method)
           : { allowed: false, reason: '当前区域环境数据缺失' };
+        const quotaExhausted = used >= limit || limit <= 0;
+        const allowed = decision.allowed && !quotaExhausted;
+        let reason: string | undefined;
+        if (!decision.allowed) {
+          reason = decision.reason ?? '当前不可采集';
+        } else if (limit <= 0) {
+          reason = `${SAMPLE_LABELS[method]} 本季配额为 0`;
+        } else if (quotaExhausted) {
+          reason = `${SAMPLE_LABELS[method]} 已达到本季动态安全配额`;
+        }
         return [
           method,
           {
             used,
-            limit: SAMPLE_LIMITS[method],
-            allowed: decision.allowed,
-            reason: decision.allowed ? undefined : decision.reason ?? '当前不可采集'
+            limit,
+            allowed,
+            reason,
+            factors: plan.factors
           }
         ];
       })
@@ -1461,17 +1622,127 @@ export class GameService {
     ).map(rowToSiteState);
   }
 
-  private countSamples(saveId: string, year: number, season: Season, speciesId: string, method: SampleMethod): number {
-    return Number(
+  private seedSeasonQuotas(save: SaveRecord, states: SpeciesState[]): void {
+    const insert = this.store.db.prepare(
+      `INSERT INTO sample_quotas
+       (save_id, year, season, site_id, species_id, method, quota, used, quota_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+       ON CONFLICT(save_id, year, season, site_id, species_id, method) DO NOTHING`
+    );
+    for (const state of states) {
+      const definition = SPECIES_BY_ID.get(state.speciesId);
+      if (!definition || !definition.zones[state.siteId]) {
+        continue;
+      }
+      for (const method of SAMPLE_METHODS) {
+        const plan = computeSeasonQuota(definition, state, save.season, method);
+        insert.run(
+          save.id,
+          save.year,
+          save.season,
+          state.siteId,
+          state.speciesId,
+          method,
+          plan.quota,
+          JSON.stringify(plan)
+        );
+      }
+    }
+
+    // 旧存档首次升级时，台账为新建，需要用已有（未撤销）样本回填实际占用。
+    this.backfillQuotaUsage(save);
+  }
+
+  private backfillQuotaUsage(save: SaveRecord): void {
+    const rows = this.store.db
+      .prepare(
+        `SELECT site_id, species_id, method, COUNT(*) AS used
+         FROM samples
+         WHERE save_id = ? AND year = ? AND season = ? AND revoked = 0
+         GROUP BY site_id, species_id, method`
+      )
+      .all(save.id, save.year, save.season) as unknown as Array<{
+      site_id: SiteId;
+      species_id: string;
+      method: SampleMethod;
+      used: number;
+    }>;
+    const sync = this.store.db.prepare(
+      `UPDATE sample_quotas SET used = ?
+       WHERE save_id = ? AND year = ? AND season = ? AND site_id = ? AND species_id = ? AND method = ?
+         AND used = 0`
+    );
+    for (const row of rows) {
+      sync.run(row.used, save.id, save.year, save.season, row.site_id, row.species_id, row.method);
+    }
+  }
+
+  private ensureSeasonQuota(save: SaveRecord, state: SpeciesState, method: SampleMethod): number {
+    const existing = this.getQuotaRow(save.id, save.year, save.season, state.siteId, state.speciesId, method);
+    if (existing) {
+      return Number(existing.quota);
+    }
+    // 旧存档惰性补建：按当前状态固化配额，并回填本季实际占用。
+    const definition = SPECIES_BY_ID.get(state.speciesId);
+    if (!definition) {
+      return 0;
+    }
+    const plan = computeSeasonQuota(definition, state, save.season, method);
+    const used = Number(
       (
         this.store.db
           .prepare(
             `SELECT COUNT(*) AS count FROM samples
-             WHERE save_id = ? AND year = ? AND season = ? AND species_id = ? AND method = ?`
+             WHERE save_id = ? AND year = ? AND season = ? AND site_id = ? AND species_id = ? AND method = ?
+               AND revoked = 0`
           )
-          .get(saveId, year, season, speciesId, method) as unknown as { count: number }
+          .get(save.id, save.year, save.season, state.siteId, state.speciesId, method) as unknown as {
+          count: number;
+        }
       ).count
     );
+    this.store.db
+      .prepare(
+        `INSERT INTO sample_quotas
+         (save_id, year, season, site_id, species_id, method, quota, used, quota_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(save_id, year, season, site_id, species_id, method) DO NOTHING`
+      )
+      .run(
+        save.id,
+        save.year,
+        save.season,
+        state.siteId,
+        state.speciesId,
+        method,
+        plan.quota,
+        used,
+        JSON.stringify(plan)
+      );
+    return plan.quota;
+  }
+
+  private getQuotaRow(
+    saveId: string,
+    year: number,
+    season: Season,
+    siteId: SiteId,
+    speciesId: string,
+    method: SampleMethod
+  ): QuotaRow | null {
+    const row = this.store.db
+      .prepare(
+        `SELECT * FROM sample_quotas
+         WHERE save_id = ? AND year = ? AND season = ? AND site_id = ? AND species_id = ? AND method = ?`
+      )
+      .get(saveId, year, season, siteId, speciesId, method) as unknown as QuotaRow | undefined;
+    return row ?? null;
+  }
+
+  private getQuotaRows(saveId: string, year: number, season: Season): QuotaRow[] {
+    return this.store.db
+      .prepare('SELECT * FROM sample_quotas WHERE save_id = ? AND year = ? AND season = ?')
+      .all(saveId, year, season) as unknown as QuotaRow[];
   }
 }
 

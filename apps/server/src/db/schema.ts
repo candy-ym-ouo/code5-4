@@ -113,11 +113,31 @@ CREATE TABLE IF NOT EXISTS samples (
   method TEXT NOT NULL,
   protocol_match INTEGER NOT NULL,
   effects_json TEXT NOT NULL,
+  revoked INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_samples_save_season
   ON samples(save_id, year, season, species_id, method);
+
+-- 按 存档/年/季/区域/物种/采集方式 维度的配额台账。
+-- quota_json 保存季初固定的动态配额快照（基础额度与各系数），
+-- used 为当前已占用数量，由单条条件 UPDATE 原子增减，防止并发超采。
+CREATE TABLE IF NOT EXISTS sample_quotas (
+  save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+  year INTEGER NOT NULL,
+  season TEXT NOT NULL,
+  site_id TEXT NOT NULL,
+  species_id TEXT NOT NULL,
+  method TEXT NOT NULL,
+  quota INTEGER NOT NULL,
+  used INTEGER NOT NULL DEFAULT 0,
+  quota_json TEXT NOT NULL,
+  PRIMARY KEY (save_id, year, season, site_id, species_id, method)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sample_quotas_season
+  ON sample_quotas(save_id, year, season);
 
 CREATE TABLE IF NOT EXISTS season_summaries (
   id TEXT PRIMARY KEY,

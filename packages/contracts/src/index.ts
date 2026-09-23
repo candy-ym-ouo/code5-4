@@ -53,6 +53,7 @@ export const CommandSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('OBSERVE_PLANT'), speciesId: z.string().min(1), values: ObservationValuesSchema }),
   z.object({ type: z.literal('RECORD_ENVIRONMENT'), values: EnvironmentValuesSchema }),
   z.object({ type: z.literal('TAKE_SAMPLE'), speciesId: z.string().min(1), method: z.enum(SAMPLE_METHODS) }),
+  z.object({ type: z.literal('REVOKE_SAMPLE'), sampleId: z.string().min(1) }),
   z.object({
     type: z.literal('RESTORE_HABITAT'),
     speciesId: z.string().min(1),
@@ -141,7 +142,20 @@ export interface SpeciesSnapshot {
     bloomPeakDay: number;
     bloomEndDay: number;
   };
-  sampleLimits: Record<SampleMethod, { used: number; limit: number; allowed: boolean; reason?: string }>;
+  sampleLimits: Record<
+    SampleMethod,
+    {
+      used: number;
+      limit: number;
+      allowed: boolean;
+      reason?: string;
+      factors?: {
+        phenology: number;
+        protection: number;
+        carryingCapacity: number;
+      };
+    }
+  >;
   unlocked: boolean;
 }
 

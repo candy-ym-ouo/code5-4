@@ -20,6 +20,9 @@ export class Store {
     if (!columns.some((column) => column.name === 'slot')) {
       this.db.exec('ALTER TABLE samples ADD COLUMN slot INTEGER NOT NULL DEFAULT 1');
     }
+    if (!columns.some((column) => column.name === 'revoked')) {
+      this.db.exec('ALTER TABLE samples ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0');
+    }
   }
 
   transaction<T>(operation: () => T): T {
